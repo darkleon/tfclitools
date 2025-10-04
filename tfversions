@@ -1,0 +1,728 @@
+#!/usr/bin/env python3
+"""
+Interactive Terraform Tools Version Selector
+Allows selecting versions for Terraform, Terragrunt, and terraform-docs
+with arrow keys and applying with Enter
+"""
+
+import subprocess
+import sys
+import termios
+import tty
+from typing import List, Dict, Optional
+from dataclasses import dataclass
+
+@dataclass
+class ToolInfo:
+    name: str
+    display_name: str
+    current_version: Optional[str]
+    available_versions: List[str]
+    env_command: str
+    check_command: List[str]
+
+class VersionSelector:
+    def __init__(self):
+        self.tools: Dict[str, ToolInfo] = {}
+        self.selected_tool = 0
+        self.selected_version = 0
+        self.in_version_menu = False
+        self.show_remote_versions = False
+        self.detected_versions = {}
+        
+        # Define supported tools
+        self.tool_configs = {
+            'terraform': ToolInfo(
+                name='terraform',
+                display_name='🔧 Terraform',
+                current_version=None,
+                available_versions=[],
+                env_command='tfenv',
+                check_command=['terraform', '--version']
+            ),
+            'terragrunt': ToolInfo(
+                name='terragrunt',
+                display_name='🏗️ Terragrunt',
+                current_version=None,
+                available_versions=[],
+                env_command='tgenv',
+                check_command=['terragrunt', '--version']
+            ),
+            'terraform-docs': ToolInfo(
+                name='terraform-docs',
+                display_name='📚 Terraform Docs',
+                current_version=None,
+                available_versions=[],
+                env_command='terraform-docs',
+                check_command=['terraform-docs', '--version']
+            )
+        }
+        
+    def check_tool_availability(self, tool_name: str) -> bool:
+        """Check if a tool manager is available"""
+        try:
+            if tool_name == 'terraform-docs':
+                # terraform-docs doesn't have a version manager like tfenv/tgenv
+                # Check if it's installed directly
+                subprocess.run(['terraform-docs', '--version'], 
+                             capture_output=True, check=True)
+                return True
+            else:
+                # Check if tfenv/tgenv is available
+                env_command = self.tool_configs[tool_name].env_command
+                subprocess.run([env_command, 'list'], 
+                             capture_output=True, check=True)
+                return True
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            return False
+
+    def get_current_version(self, tool_name: str) -> Optional[str]:
+        """Get the current version of a tool"""
+        try:
+            check_command = self.tool_configs[tool_name].check_command
+            result = subprocess.run(check_command, 
+                                  capture_output=True, text=True, check=True)
+            
+            output = result.stdout.strip()
+            
+            if tool_name == 'terraform':
+                # Terraform version output: "Terraform v1.5.0"
+                if 'Terraform v' in output:
+                    return output.split('Terraform v')[1].split()[0]
+            elif tool_name == 'terragrunt':
+                # Terragrunt version output: "terragrunt version v0.48.0"
+                if 'terragrunt version v' in output:
+                    return output.split('terragrunt version v')[1].split()[0]
+            elif tool_name == 'terraform-docs':
+                # terraform-docs version output: "terraform-docs version v0.16.0" or "0.6.0"
+                if 'terraform-docs version v' in output:
+                    return output.split('terraform-docs version v')[1].split()[0]
+                elif output.replace('.', '').isdigit():
+                    # Handle plain version number output like "0.6.0"
+                    return output
+            
+            return None
+            
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            return None
+
+    def get_available_versions(self, tool_name: str) -> List[str]:
+        """Get available versions for a tool"""
+        versions = []
+        
+        try:
+            if tool_name == 'terraform-docs':
+                # Check for installed terraform-docs versions (versioned binaries)
+                try:
+                    result = subprocess.run(['ls', '/usr/local/bin/'], capture_output=True, text=True, check=True)
+                    for line in result.stdout.split('\n'):
+                        if line.startswith('terraform-docs-') and not line.endswith('.bak'):
+                            version = line.replace('terraform-docs-', '')
+                            if version:
+                                versions.append(version)
+                except subprocess.CalledProcessError:
+                    pass
+                
+                # Also add current version if it exists and not already in list
+                current = self.get_current_version(tool_name)
+                if current and current not in versions:
+                    versions.append(current)
+                    
+            else:
+                env_command = self.tool_configs[tool_name].env_command
+                result = subprocess.run([env_command, 'list'], 
+                                      capture_output=True, text=True, check=True)
+                
+                for line in result.stdout.strip().split('\n'):
+                    line = line.strip()
+                    if line and not line.startswith('No versions'):
+                        # Handle lines like "* 0.13.7 (set by...)" or just "0.13.7"
+                        if line.startswith('*'):
+                            # Extract version from "* 0.13.7 (set by...)"
+                            version = line.split()[1] if len(line.split()) > 1 else ''
+                        else:
+                            # Extract version from plain line
+                            version = line.split()[0] if line.split() else ''
+                        
+                        if version and version not in versions:
+                            versions.append(version)
+                            
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            pass
+            
+        return sorted(versions, reverse=True)  # Latest versions first
+
+    def get_remote_versions(self, tool_name: str) -> List[str]:
+        """Get available remote versions that can be installed"""
+        versions = []
+        
+        try:
+            if tool_name == 'terraform-docs':
+                # Same as available versions since we get from GitHub
+                return self.get_available_versions(tool_name)
+            else:
+                env_command = self.tool_configs[tool_name].env_command
+                result = subprocess.run([env_command, 'list-remote'], 
+                                      capture_output=True, text=True, check=True)
+                
+                lines = result.stdout.strip().split('\n')
+                for line in lines[:20]:  # Get latest 20 versions
+                    line = line.strip()
+                    if line and line.replace('.', '').replace('-', '').replace('_', '').replace('rc', '').replace('beta', '').replace('alpha', '')[0].isdigit():
+                        versions.append(line)
+                            
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            pass
+            
+        return versions
+
+    def load_tool_info(self):
+        """Load information for all tools"""
+        for tool_name, tool_info in self.tool_configs.items():
+            if self.check_tool_availability(tool_name):
+                tool_info.current_version = self.get_current_version(tool_name)
+                tool_info.available_versions = self.get_available_versions(tool_name)
+                self.tools[tool_name] = tool_info
+    
+    def detect_version_files(self):
+        """Detect .terraform-version and .terragrunt-version files in current directory"""
+        import os
+        
+        self.detected_versions = {}
+        
+        # Check for .terraform-version
+        if os.path.exists('.terraform-version'):
+            try:
+                with open('.terraform-version', 'r') as f:
+                    version = f.read().strip()
+                    if version:
+                        self.detected_versions['terraform'] = version
+            except Exception:
+                pass
+        
+        # Check for .terragrunt-version
+        if os.path.exists('.terragrunt-version'):
+            try:
+                with open('.terragrunt-version', 'r') as f:
+                    version = f.read().strip()
+                    if version:
+                        self.detected_versions['terragrunt'] = version
+            except Exception:
+                pass
+        
+        # Recommend terraform-docs version based on detected Terraform version
+        if 'terraform' in self.detected_versions:
+            recommended = self.get_recommended_terraform_docs_version(self.detected_versions['terraform'])
+            if recommended:
+                self.detected_versions['terraform-docs'] = recommended
+    
+    def display_detected_versions_table(self):
+        """Display a table of detected version files and recommended versions"""
+        if not self.detected_versions:
+            return
+        
+        print("\nDetected Version Configuration:")
+        print("-" * 80)
+        print(f"{'Tool':<20} {'File Version':<20} {'Current Version':<20} {'Action':<20}")
+        print("-" * 80)
+        
+        for tool_name in ['terraform', 'terragrunt', 'terraform-docs']:
+            if tool_name in self.detected_versions:
+                file_version = self.detected_versions[tool_name]
+                tool = self.tools.get(tool_name)
+                current = f"v{tool.current_version}" if tool and tool.current_version else "Not installed"
+                
+                # Determine action
+                if tool and tool.current_version:
+                    if tool.current_version == file_version:
+                        action = "OK"
+                    else:
+                        action = "Switch needed"
+                else:
+                    action = "Install needed"
+                
+                # Color code the action
+                if action == "OK":
+                    action_str = f"\033[32m{action}\033[0m"
+                elif action == "Switch needed":
+                    action_str = f"\033[33m{action}\033[0m"
+                else:
+                    action_str = f"\033[31m{action}\033[0m"
+                
+                tool_display = self.tool_configs[tool_name].display_name if tool_name in self.tool_configs else tool_name
+                print(f"{tool_display:<20} v{file_version:<19} {current:<20} {action_str}")
+        
+        print("-" * 80)
+        
+        # Check if any action is needed
+        needs_action = False
+        for tool_name, file_version in self.detected_versions.items():
+            tool = self.tools.get(tool_name)
+            if not tool or not tool.current_version or tool.current_version != file_version:
+                needs_action = True
+                break
+        
+        if needs_action:
+            print("Press 'a' to apply all detected versions automatically")
+        print()
+    
+    def apply_all_detected_versions(self):
+        """Apply all detected versions from version files"""
+        if not self.detected_versions:
+            return
+        
+        print("\nApplying detected versions...")
+        print("=" * 50)
+        
+        success_count = 0
+        fail_count = 0
+        
+        for tool_name, file_version in self.detected_versions.items():
+            tool = self.tools.get(tool_name)
+            
+            if not tool:
+                print(f"\n{tool_name}: Tool not available, skipping")
+                fail_count += 1
+                continue
+            
+            if tool.current_version == file_version:
+                print(f"\n{tool_name}: Already on v{file_version}")
+                success_count += 1
+                continue
+            
+            # Check if version is installed
+            if file_version not in tool.available_versions:
+                print(f"\n{tool_name}: Installing v{file_version}...")
+                if not self.install_version(tool_name, file_version):
+                    print(f"  Failed to install v{file_version}")
+                    fail_count += 1
+                    continue
+                else:
+                    print(f"  Successfully installed v{file_version}")
+            
+            # Switch to the version
+            print(f"\n{tool_name}: Switching to v{file_version}...")
+            if self.switch_version(tool_name, file_version):
+                print(f"  Successfully switched to v{file_version}")
+                success_count += 1
+            else:
+                print(f"  Failed to switch to v{file_version}")
+                fail_count += 1
+        
+        print("\n" + "=" * 50)
+        print(f"Summary: {success_count} successful, {fail_count} failed")
+        
+        # Reload tool info
+        self.load_tool_info()
+        
+        input("\nPress Enter to continue...")
+
+
+    def display_main_menu(self):
+        """Display the main tool selection menu"""
+        print('\033[2J\033[H')
+        
+        print("Terraform Tools Version Manager")
+        print("=" * 50)
+        
+        # Display detected versions table if any
+        self.display_detected_versions_table()
+        
+        print("Use ↑/↓ arrows to navigate, Enter to select versions, ESC to exit")
+        print()
+        
+        tool_list = list(self.tools.values())
+        
+        for i, tool in enumerate(tool_list):
+            prefix = "➤ " if i == self.selected_tool else "  "
+            current_info = f" (current: v{tool.current_version})" if tool.current_version else " (not detected)"
+            
+            # Highlight selected item
+            if i == self.selected_tool:
+                print(f"\033[1;36m{prefix}{tool.display_name}{current_info}\033[0m")
+            else:
+                print(f"{prefix}{tool.display_name}{current_info}")
+                
+        if not self.tools:
+            print("❌ No supported tools found!")
+            print("\nPlease install:")
+            print("  • tfenv (for Terraform version management)")
+            print("  • tgenv (for Terragrunt version management)")
+            print("  • terraform-docs (direct installation)")
+
+    def get_recommended_terraform_docs_version(self, terraform_version: str) -> str:
+        """Get the exact recommended terraform-docs version for a Terraform version"""
+        if not terraform_version:
+            return ""
+            
+        try:
+            version_parts = terraform_version.split('.')
+            tf_major = int(version_parts[0])
+            tf_minor = int(version_parts[1]) if len(version_parts) > 1 else 0
+            
+            # Return exact recommended versions
+            if tf_major == 1:
+                if tf_minor >= 9:
+                    return "0.19.0"
+                else:
+                    return "0.15.0"
+            elif tf_major == 0:
+                if tf_minor == 13:
+                    return "0.10.1"
+                elif tf_minor == 12:
+                    return "0.8.2"
+                elif tf_minor == 11:
+                    return "0.6.0"
+                    
+        except (ValueError, IndexError):
+            pass
+            
+        return ""
+
+    def get_terraform_docs_compatibility(self, terraform_version: str) -> str:
+        """Get recommended terraform-docs version for a given Terraform version"""
+        if not terraform_version:
+            return ""
+            
+        # Parse terraform version
+        try:
+            version_parts = terraform_version.split('.')
+            tf_major = int(version_parts[0])
+            tf_minor = int(version_parts[1]) if len(version_parts) > 1 else 0
+            
+            # Specific compatibility mapping based on your requirements
+            if tf_major == 1:
+                if tf_minor >= 9:
+                    return "v0.19.0 recommended"
+                else:
+                    return "v0.15.0 recommended"
+            elif tf_major == 0:
+                if tf_minor == 13:
+                    return "v0.10.1 recommended (requires .terraform-docs.yml)"
+                elif tf_minor == 12:
+                    return "v0.8.2 recommended"
+                elif tf_minor == 11:
+                    return "v0.6.0 recommended"
+                else:
+                    return "Check compatibility manually"
+            else:
+                return "Latest version recommended"
+                
+        except (ValueError, IndexError):
+            return ""
+
+    def display_version_menu(self):
+        """Display version selection menu for the selected tool"""
+        print('\033[2J\033[H')
+        
+        tool_list = list(self.tools.values())
+        current_tool = tool_list[self.selected_tool]
+        
+        print(f"📦 {current_tool.display_name} - Version Selection")
+        print("=" * 50)
+        print(f"Current version: {current_tool.current_version or 'Not detected'}")
+        
+        # Show compatibility info for terraform-docs
+        if current_tool.name == 'terraform-docs':
+            terraform_tool = self.tools.get('terraform')
+            if terraform_tool and terraform_tool.current_version:
+                compatibility = self.get_terraform_docs_compatibility(terraform_tool.current_version)
+                recommended_version = self.get_recommended_terraform_docs_version(terraform_tool.current_version)
+                if compatibility:
+                    print(f"For Terraform v{terraform_tool.current_version}: {compatibility}")
+                    if recommended_version and recommended_version not in current_tool.available_versions:
+                        print(f"💡 Press 'q' to quick-install recommended version (v{recommended_version})")
+        
+        print()
+        
+        if self.show_remote_versions:
+            print("🌐 Available Remote Versions (↓/↑ navigate, Enter to install, 'i' for installed, ESC to go back)")
+        else:
+            print("💾 Installed Versions (↓/↑ navigate, Enter to switch, 'r' for remote, ESC to go back)")
+        print()
+        
+        # Get the appropriate version list
+        if self.show_remote_versions:
+            versions = self.get_remote_versions(current_tool.name)
+            installed_versions = current_tool.available_versions
+        else:
+            versions = current_tool.available_versions
+            installed_versions = versions
+            
+        if not versions:
+            if self.show_remote_versions:
+                print("❌ No remote versions available")
+            else:
+                print("❌ No installed versions")
+                if current_tool.name != 'terraform-docs':
+                    print(f"Install versions using: {current_tool.env_command} install <version>")
+                else:
+                    print("Press 'r' to see available remote versions to install")
+            return
+            
+        for i, version in enumerate(versions):
+            prefix = "➤ " if i == self.selected_version else "  "
+            
+            if self.show_remote_versions:
+                # Show installation status for remote versions
+                if version in installed_versions:
+                    status = " (installed)"
+                    if version == current_tool.current_version:
+                        status = " (installed, current)"
+                else:
+                    status = " (not installed)"
+            else:
+                # Show current status for installed versions
+                status = " (current)" if version == current_tool.current_version else ""
+            
+            # Highlight selected item
+            if i == self.selected_version:
+                print(f"\033[1;36m{prefix}v{version}{status}\033[0m")
+            else:
+                print(f"{prefix}v{version}{status}")
+
+    def get_key(self):
+        """Get a single keypress from stdin"""
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        try:
+            tty.setraw(sys.stdin.fileno())
+            key = sys.stdin.read(1)
+            
+            # Handle arrow keys (they send escape sequences)
+            if key == '\x1b':  # ESC sequence
+                key += sys.stdin.read(2)
+                
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        
+        return key
+
+    def install_version(self, tool_name: str, version: str) -> bool:
+        """Install a specific version of a tool"""
+        try:
+            if tool_name == 'terraform-docs':
+                # Download and install terraform-docs from GitHub releases
+                print(f"Downloading terraform-docs v{version}...")
+                
+                # Determine architecture
+                arch_result = subprocess.run(['uname', '-m'], capture_output=True, text=True)
+                arch = arch_result.stdout.strip()
+                if arch == 'x86_64':
+                    arch = 'amd64'
+                elif arch.startswith('arm'):
+                    arch = 'arm64'
+                
+                # Download URL
+                url = f"https://github.com/terraform-docs/terraform-docs/releases/download/v{version}/terraform-docs-v{version}-darwin-{arch}.tar.gz"
+                
+                # Create temp directory and download
+                temp_dir = f"/tmp/terraform-docs-{version}"
+                subprocess.run(['mkdir', '-p', temp_dir], check=True)
+                
+                try:
+                    # Download and extract
+                    subprocess.run(['curl', '-L', '-o', f"{temp_dir}/terraform-docs.tar.gz", url], check=True)
+                    subprocess.run(['tar', '-xzf', f"{temp_dir}/terraform-docs.tar.gz", '-C', temp_dir], check=True)
+                    
+                    # Create versioned binary name
+                    versioned_name = f"terraform-docs-{version}"
+                    
+                    # Install to /usr/local/bin with version suffix
+                    subprocess.run(['sudo', 'cp', f"{temp_dir}/terraform-docs", f'/usr/local/bin/{versioned_name}'], check=True)
+                    subprocess.run(['sudo', 'chmod', '+x', f'/usr/local/bin/{versioned_name}'], check=True)
+                    
+                    # Create/update symlink to point to this version
+                    subprocess.run(['sudo', 'rm', '-f', '/usr/local/bin/terraform-docs'], check=False)
+                    subprocess.run(['sudo', 'ln', '-s', f'/usr/local/bin/{versioned_name}', '/usr/local/bin/terraform-docs'], check=True)
+                    
+                except subprocess.CalledProcessError as e:
+                    print(f"❌ Download failed. Error: {e}")
+                    return False
+                finally:
+                    # Cleanup
+                    subprocess.run(['rm', '-rf', temp_dir], check=False)
+                
+                return True
+            else:
+                env_command = self.tool_configs[tool_name].env_command
+                subprocess.run([env_command, 'install', version], 
+                             capture_output=True, text=True, check=True)
+                return True
+                
+        except subprocess.CalledProcessError as e:
+            print(f"❌ Error installing version: {e}")
+            if e.stderr:
+                print(f"Details: {e.stderr}")
+            return False
+
+    def switch_version(self, tool_name: str, version: str) -> bool:
+        """Switch to the selected version"""
+        try:
+            if tool_name == 'terraform-docs':
+                # For terraform-docs, switch the symlink to point to the versioned binary
+                versioned_binary = f"/usr/local/bin/terraform-docs-{version}"
+                
+                # Check if the versioned binary exists
+                if not subprocess.run(['test', '-f', versioned_binary], capture_output=True).returncode == 0:
+                    print(f"❌ terraform-docs v{version} is not installed")
+                    return False
+                
+                # Update symlink to point to this version
+                subprocess.run(['sudo', 'rm', '-f', '/usr/local/bin/terraform-docs'], check=False)
+                subprocess.run(['sudo', 'ln', '-s', versioned_binary, '/usr/local/bin/terraform-docs'], check=True)
+                return True
+            else:
+                env_command = self.tool_configs[tool_name].env_command
+                subprocess.run([env_command, 'use', version], 
+                             capture_output=True, text=True, check=True)
+                return True
+                
+        except subprocess.CalledProcessError as e:
+            print(f"❌ Error switching version: {e}")
+            if e.stderr:
+                print(f"Details: {e.stderr}")
+            return False
+
+    def run(self):
+        """Main loop"""
+        self.load_tool_info()
+        self.detect_version_files()
+        
+        if not self.tools:
+            self.display_main_menu()
+            input("\nPress Enter to exit...")
+            return 1
+
+        while True:
+            if self.in_version_menu:
+                self.display_version_menu()
+            else:
+                self.display_main_menu()
+                
+            key = self.get_key()
+            
+            if key == '\x1b[A':  # Up arrow
+                if self.in_version_menu:
+                    tool_list = list(self.tools.values())
+                    current_tool = tool_list[self.selected_tool]
+                    versions = self.get_remote_versions(current_tool.name) if self.show_remote_versions else current_tool.available_versions
+                    if versions:
+                        self.selected_version = (self.selected_version - 1) % len(versions)
+                else:
+                    self.selected_tool = (self.selected_tool - 1) % len(self.tools)
+                    
+            elif key == '\x1b[B':  # Down arrow
+                if self.in_version_menu:
+                    tool_list = list(self.tools.values())
+                    current_tool = tool_list[self.selected_tool]
+                    versions = self.get_remote_versions(current_tool.name) if self.show_remote_versions else current_tool.available_versions
+                    if versions:
+                        self.selected_version = (self.selected_version + 1) % len(versions)
+                else:
+                    self.selected_tool = (self.selected_tool + 1) % len(self.tools)
+                    
+            elif key == '\r' or key == '\n':  # Enter
+                if self.in_version_menu:
+                    # Select/install version
+                    tool_list = list(self.tools.values())
+                    current_tool = tool_list[self.selected_tool]
+                    
+                    versions = self.get_remote_versions(current_tool.name) if self.show_remote_versions else current_tool.available_versions
+                    
+                    if versions:
+                        selected_version = versions[self.selected_version]
+                        
+                        if self.show_remote_versions:
+                            # Install version
+                            if selected_version in current_tool.available_versions:
+                                if selected_version == current_tool.current_version:
+                                    print(f"\n✅ Version v{selected_version} is already active")
+                                else:
+                                    print(f"\nSwitching {current_tool.name} to version v{selected_version}...")
+                                    if self.switch_version(current_tool.name, selected_version):
+                                        print(f"✅ Successfully switched to v{selected_version}")
+                                        self.load_tool_info()
+                                    else:
+                                        print(f"❌ Failed to switch to v{selected_version}")
+                            else:
+                                print(f"\nInstalling {current_tool.name} v{selected_version}...")
+                                if self.install_version(current_tool.name, selected_version):
+                                    print(f"✅ Successfully installed v{selected_version}")
+                                    if self.switch_version(current_tool.name, selected_version):
+                                        print(f"✅ Successfully switched to v{selected_version}")
+                                    self.load_tool_info()
+                                else:
+                                    print(f"❌ Failed to install v{selected_version}")
+                        else:
+                            # Switch to installed version
+                            if selected_version == current_tool.current_version:
+                                print(f"\n✅ Version v{selected_version} is already active")
+                            else:
+                                print(f"\nSwitching {current_tool.name} to version v{selected_version}...")
+                                if self.switch_version(current_tool.name, selected_version):
+                                    print(f"✅ Successfully switched to v{selected_version}")
+                                    self.load_tool_info()
+                                else:
+                                    print(f"❌ Failed to switch to v{selected_version}")
+                        
+                        input("\nPress Enter to continue...")
+                        self.in_version_menu = False
+                        self.selected_version = 0
+                        self.show_remote_versions = False
+                else:
+                    # Enter version selection
+                    self.in_version_menu = True
+                    self.selected_version = 0
+                    self.show_remote_versions = False
+                    
+            elif key == 'r' and self.in_version_menu:  # 'r' for remote versions
+                self.show_remote_versions = True
+                self.selected_version = 0
+                
+            elif key == 'i' and self.in_version_menu:  # 'i' for installed versions
+                self.show_remote_versions = False
+                self.selected_version = 0
+            
+            elif key == 'a' and not self.in_version_menu and self.detected_versions:  # 'a' for apply all
+                self.apply_all_detected_versions()
+                
+            elif key == 'q' and self.in_version_menu:  # 'q' for quick install recommended version
+                tool_list = list(self.tools.values())
+                current_tool = tool_list[self.selected_tool]
+                
+                if current_tool.name == 'terraform-docs':
+                    terraform_tool = self.tools.get('terraform')
+                    if terraform_tool and terraform_tool.current_version:
+                        recommended_version = self.get_recommended_terraform_docs_version(terraform_tool.current_version)
+                        if recommended_version:
+                            print(f"\nQuick-installing recommended terraform-docs v{recommended_version}...")
+                            if self.install_version(current_tool.name, recommended_version):
+                                print(f"✅ Successfully installed v{recommended_version}")
+                                if self.switch_version(current_tool.name, recommended_version):
+                                    print(f"✅ Successfully switched to v{recommended_version}")
+                                self.load_tool_info()
+                            else:
+                                print(f"❌ Failed to install v{recommended_version}")
+                            
+                            input("\nPress Enter to continue...")
+                            self.in_version_menu = False
+                            self.selected_version = 0
+                            self.show_remote_versions = False
+                    
+            elif key.startswith('\x1b') and key != '\x1b[A' and key != '\x1b[B':  # ESC (not arrow keys)
+                if self.in_version_menu:
+                    self.in_version_menu = False
+                    self.selected_version = 0
+                    self.show_remote_versions = False
+                else:
+                    print("\n👋 Goodbye!")
+                    return 0
+                    
+            elif key == '\x03':  # Ctrl+C
+                print("\n👋 Goodbye!")
+                return 0
+
+if __name__ == "__main__":
+    selector = VersionSelector()
+    sys.exit(selector.run())
